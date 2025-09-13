@@ -55,7 +55,7 @@ export default async function handler(req, res) {
 
     try {
       // Execute Python summarizer script
-      const command = `python lib/legal_summarizer.py "${file.filepath || file.filepath}" "${outputPath}"`;
+      const command = `python3 lib/legal_summarizer.py "${file.filepath || file.filepath}" "${outputPath}"`;
       console.log('Executing command:', command);
       
       const { stdout, stderr } = await execAsync(command);
