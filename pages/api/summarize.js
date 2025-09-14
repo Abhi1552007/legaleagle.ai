@@ -1,12 +1,17 @@
 import formidable from "formidable";
 import fs from "fs";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib"; // added rgb
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import pdfParse from "pdf-parse";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 export const config = {
   api: { bodyParser: false },
 };
+
+// 🔹 Sanitize text for PDF (remove unsupported chars like ₹)
+function sanitizeText(text) {
+  return text.replace(/[^\x00-\x7F]/g, "?");
+}
 
 // Extract text page by page
 async function extractTextByPage(pdfBuffer) {
@@ -44,6 +49,7 @@ ${text}`;
 
 // Helper to wrap text
 function drawWrappedText(page, text, { x, y, width, font, size, lineHeight }) {
+  text = sanitizeText(text); // ✅ sanitize before drawing
   const words = text.split(/\s+/);
   let line = "";
   let cursorY = y;
@@ -75,7 +81,7 @@ async function buildSideBySidePdf(originalPages, summaries) {
     const colGap = 20;
     const colWidth = (595 - 2 * margin - colGap) / 2;
     const boxTop = height - 80;
-    const boxHeight = 700; // box height
+    const boxHeight = 700;
 
     // Title
     page.drawText(`Document Page ${i + 1}`, {
@@ -131,6 +137,14 @@ async function buildSideBySidePdf(originalPages, summaries) {
       font,
       size: 9,
       lineHeight: 12,
+    });
+
+    // Footer (page number)
+    page.drawText(`Page ${i + 1}`, {
+      x: 270,
+      y: 20,
+      size: 9,
+      font,
     });
   }
 
