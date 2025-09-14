@@ -1,96 +1,183 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import formidable from 'formidable';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
-
-const execAsync = promisify(exec);
+import formidable from "formidable";
+import fs from "fs";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib"; // added rgb
+import pdfParse from "pdf-parse";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 export const config = {
-  api: {
-    bodyParser: false,
-  },
+  api: { bodyParser: false },
 };
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+// Extract text page by page
+async function extractTextByPage(pdfBuffer) {
+  const pages = [];
+  const options = {
+    pagerender: async (pageData) => {
+      const textContent = await pageData.getTextContent();
+      const pageText = textContent.items.map((item) => item.str).join(" ");
+      pages.push(pageText.trim());
+      return "";
+    },
+  };
+  await pdfParse(pdfBuffer, options);
+  return pages;
+}
+
+// Summarize a single page
+async function summarizePage(text, genAI) {
+  if (!text || text.length < 25) return "[Skipped: too little content]";
+  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-lite" });
+
+  const prompt = `Summarize this legal text in numbered points (1., 2., 3.)
+Use plain English. Start with the most important points.
+
+${text}`;
 
   try {
-    // Use system temp directory (e.g. /tmp) for Vercel
-    const baseTmpDir = path.join(os.tmpdir(), 'legal-summarizer');
-    if (!fs.existsSync(baseTmpDir)) {
-      fs.mkdirSync(baseTmpDir, { recursive: true });
-    }
+    const result = await model.generateContent(prompt);
+    return result.response.text().trim();
+  } catch (err) {
+    console.error("Gemini error:", err.message);
+    return `[Error: ${err.message}]`;
+  }
+}
 
-    const form = formidable({
-      uploadDir: baseTmpDir,
-      keepExtensions: true,
+// Helper to wrap text
+function drawWrappedText(page, text, { x, y, width, font, size, lineHeight }) {
+  const words = text.split(/\s+/);
+  let line = "";
+  let cursorY = y;
+
+  for (let word of words) {
+    const testLine = line ? `${line} ${word}` : word;
+    const testWidth = font.widthOfTextAtSize(testLine, size);
+    if (testWidth > width) {
+      page.drawText(line, { x, y: cursorY, size, font });
+      cursorY -= lineHeight;
+      line = word;
+    } else {
+      line = testLine;
+    }
+  }
+  if (line) page.drawText(line, { x, y: cursorY, size, font });
+}
+
+// Build side-by-side PDF with boxes
+async function buildSideBySidePdf(originalPages, summaries) {
+  const pdfDoc = await PDFDocument.create();
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+  for (let i = 0; i < originalPages.length; i++) {
+    const page = pdfDoc.addPage([595, 842]); // A4
+    const { height } = page.getSize();
+
+    const margin = 40;
+    const colGap = 20;
+    const colWidth = (595 - 2 * margin - colGap) / 2;
+    const boxTop = height - 80;
+    const boxHeight = 700; // box height
+
+    // Title
+    page.drawText(`Document Page ${i + 1}`, {
+      x: margin,
+      y: height - 40,
+      size: 14,
+      font,
     });
 
-    // Parse form with Promise wrapper because formidable.parse doesn't return Promise by default
-    const parseForm = () => new Promise((resolve, reject) => {
-      form.parse(req, (err, fields, files) => {
-        if (err) reject(err);
-        else resolve([fields, files]);
-      });
+    // Headers
+    page.drawText("Original Text", { x: margin, y: height - 60, size: 10, font });
+    page.drawText("Gemini Summary", {
+      x: margin + colWidth + colGap,
+      y: height - 60,
+      size: 10,
+      font,
     });
 
-    const [fields, files] = await parseForm();
-    const file = files.file?.[0] || files.file; // handle single file or array
+    // Draw boxes
+    page.drawRectangle({
+      x: margin - 5,
+      y: boxTop - boxHeight,
+      width: colWidth + 10,
+      height: boxHeight,
+      borderColor: rgb(0, 0, 0),
+      borderWidth: 1,
+    });
 
-    if (!file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+    page.drawRectangle({
+      x: margin + colWidth + colGap - 5,
+      y: boxTop - boxHeight,
+      width: colWidth + 10,
+      height: boxHeight,
+      borderColor: rgb(0, 0, 0),
+      borderWidth: 1,
+    });
+
+    // Original text
+    drawWrappedText(page, originalPages[i], {
+      x: margin,
+      y: boxTop - 20,
+      width: colWidth,
+      font,
+      size: 9,
+      lineHeight: 12,
+    });
+
+    // Summary text
+    drawWrappedText(page, summaries[i], {
+      x: margin + colWidth + colGap,
+      y: boxTop - 20,
+      width: colWidth,
+      font,
+      size: 9,
+      lineHeight: 12,
+    });
+  }
+
+  return await pdfDoc.save();
+}
+
+// API Handler
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  const form = formidable({});
+  form.parse(req, async (err, fields, files) => {
+    if (err) {
+      console.error("Formidable error:", err);
+      return res.status(500).json({ error: "File upload failed" });
     }
-
-    console.log('Input file:', file.filepath || file.filepath);
-
-    // Generate unique output filename in temp directory
-    const timestamp = Date.now();
-    const outputPath = path.join(baseTmpDir, `summary_${timestamp}.pdf`);
-
-    console.log('Output path:', outputPath);
 
     try {
-      // Execute Python summarizer script
-      const command = `python3 lib/legal_summarizer.py "${file.filepath || file.filepath}" "${outputPath}"`;
-      console.log('Executing command:', command);
-      
-      const { stdout, stderr } = await execAsync(command);
-      console.log('Python stdout:', stdout);
-      if (stderr) console.log('Python stderr:', stderr);
-
-      // Check if output PDF was created
-      if (!fs.existsSync(outputPath)) {
-        throw new Error(`Output file not created at ${outputPath}`);
+      const file = files.file?.[0] || files.file;
+      if (!file) {
+        return res.status(400).json({ error: "No file uploaded" });
       }
 
-      // Read generated summary PDF
-      const pdfBuffer = fs.readFileSync(outputPath);
-      console.log('PDF file size:', pdfBuffer.length);
+      const pdfBuffer = fs.readFileSync(file.filepath);
 
-      // Clean up temp files
-      if (file.filepath && fs.existsSync(file.filepath)) fs.unlinkSync(file.filepath);
-      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+      // Extract text page by page
+      const originalPages = await extractTextByPage(pdfBuffer);
 
-      // Send PDF as response for download
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', 'attachment; filename="summary.pdf"');
-      res.send(pdfBuffer);
+      // Summarize each page
+      const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+      const summaries = [];
+      for (const pageText of originalPages) {
+        const summary = await summarizePage(pageText, genAI);
+        summaries.push(summary);
+      }
 
+      // Build final PDF
+      const finalPdfBytes = await buildSideBySidePdf(originalPages, summaries);
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", "attachment; filename=summary.pdf");
+      res.send(Buffer.from(finalPdfBytes));
     } catch (error) {
-      console.error('Python script error:', error);
-      // Clean up uploaded file if exists
-      if (file.filepath && fs.existsSync(file.filepath)) {
-        fs.unlinkSync(file.filepath);
-      }
-      res.status(500).json({ error: 'Failed to process document: ' + error.message });
+      console.error("Summarize API error:", error);
+      res.status(500).json({ error: "Failed to process file" });
     }
-
-  } catch (error) {
-    console.error('API error:', error);
-    res.status(500).json({ error: 'Internal server error: ' + error.message });
-  }
+  });
 }
