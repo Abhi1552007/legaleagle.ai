@@ -1,17 +1,14 @@
 import formidable from "formidable";
 import fs from "fs";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import path from "path";
+import { PDFDocument, rgb } from "pdf-lib";
 import pdfParse from "pdf-parse";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import fontkit from "@pdf-lib/fontkit";
 
 export const config = {
   api: { bodyParser: false },
 };
-
-// 🔹 Sanitize text for PDF (remove unsupported chars like ₹)
-function sanitizeText(text) {
-  return text.replace(/[^\x00-\x7F]/g, "?");
-}
 
 // Extract text page by page
 async function extractTextByPage(pdfBuffer) {
@@ -31,7 +28,7 @@ async function extractTextByPage(pdfBuffer) {
 // Summarize a single page
 async function summarizePage(text, genAI) {
   if (!text || text.length < 25) return "[Skipped: too little content]";
-  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-lite" });
+  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
   const prompt = `Summarize this legal text in numbered points (1., 2., 3.)
 Use plain English. Start with the most important points.
@@ -47,31 +44,49 @@ ${text}`;
   }
 }
 
-// Helper to wrap text
-function drawWrappedText(page, text, { x, y, width, font, size, lineHeight }) {
-  text = sanitizeText(text); // ✅ sanitize before drawing
-  const words = text.split(/\s+/);
-  let line = "";
+// Helper to wrap text (bold numbers in summary)
+function drawWrappedText(page, text, { x, y, width, font, boldFont, size, lineHeight }) {
+  const lines = text.split("\n");
   let cursorY = y;
 
-  for (let word of words) {
-    const testLine = line ? `${line} ${word}` : word;
-    const testWidth = font.widthOfTextAtSize(testLine, size);
-    if (testWidth > width) {
-      page.drawText(line, { x, y: cursorY, size, font });
+  for (let line of lines) {
+    const isNumbered = /^\d+\./.test(line.trim());
+    const currentFont = isNumbered ? boldFont : font;
+
+    const words = line.split(/\s+/);
+    let currentLine = "";
+
+    for (let word of words) {
+      const testLine = currentLine ? `${currentLine} ${word}` : word;
+      const testWidth = currentFont.widthOfTextAtSize(testLine, size);
+
+      if (testWidth > width) {
+        page.drawText(currentLine, { x, y: cursorY, size, font: currentFont });
+        cursorY -= lineHeight;
+        currentLine = word;
+      } else {
+        currentLine = testLine;
+      }
+    }
+
+    if (currentLine) {
+      page.drawText(currentLine, { x, y: cursorY, size, font: currentFont });
       cursorY -= lineHeight;
-      line = word;
-    } else {
-      line = testLine;
     }
   }
-  if (line) page.drawText(line, { x, y: cursorY, size, font });
 }
 
-// Build side-by-side PDF with boxes
+// Build side-by-side PDF with boxes + footer page numbers
 async function buildSideBySidePdf(originalPages, summaries) {
   const pdfDoc = await PDFDocument.create();
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  pdfDoc.registerFontkit(fontkit);
+
+  // Load fonts (put fonts in /public/fonts)
+  const fontBytes = fs.readFileSync(path.join(process.cwd(), "public", "fonts", "NotoSans-Regular.ttf"));
+  const boldFontBytes = fs.readFileSync(path.join(process.cwd(), "public", "fonts", "NotoSans-Bold.ttf"));
+
+  const font = await pdfDoc.embedFont(fontBytes);
+  const boldFont = await pdfDoc.embedFont(boldFontBytes);
 
   for (let i = 0; i < originalPages.length; i++) {
     const page = pdfDoc.addPage([595, 842]); // A4
@@ -88,16 +103,16 @@ async function buildSideBySidePdf(originalPages, summaries) {
       x: margin,
       y: height - 40,
       size: 14,
-      font,
+      font: boldFont,
     });
 
     // Headers
-    page.drawText("Original Text", { x: margin, y: height - 60, size: 10, font });
+    page.drawText("Original Text", { x: margin, y: height - 60, size: 10, font: boldFont });
     page.drawText("Gemini Summary", {
       x: margin + colWidth + colGap,
       y: height - 60,
       size: 10,
-      font,
+      font: boldFont,
     });
 
     // Draw boxes
@@ -125,6 +140,7 @@ async function buildSideBySidePdf(originalPages, summaries) {
       y: boxTop - 20,
       width: colWidth,
       font,
+      boldFont,
       size: 9,
       lineHeight: 12,
     });
@@ -135,15 +151,16 @@ async function buildSideBySidePdf(originalPages, summaries) {
       y: boxTop - 20,
       width: colWidth,
       font,
+      boldFont,
       size: 9,
       lineHeight: 12,
     });
 
-    // Footer (page number)
-    page.drawText(`Page ${i + 1}`, {
+    // Footer page number
+    page.drawText(`Page ${i + 1} of ${originalPages.length}`, {
       x: 270,
       y: 20,
-      size: 9,
+      size: 10,
       font,
     });
   }
